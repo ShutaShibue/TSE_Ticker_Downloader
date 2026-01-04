@@ -351,10 +351,46 @@ def get_stock_data(ticker: str, start_date: str, end_date: Optional[str] = None,
             
             # 空のDataFrameの場合のチェック
             if hist.empty:
-                # エラーメッセージから上場廃止の可能性をチェック
-                # yfinanceはエラーメッセージをログに出力するが、例外を投げない場合がある
-                logger.warning(f"データが取得できませんでした（空）: {ticker} - 上場廃止の可能性があります")
-                return None
+                # 開始日が非常に近い過去の場合、yfinanceが空を返す可能性がある
+                # 開始日を少し前にずらして再試行する
+                try:
+                    start_date_dt = pd.to_datetime(start_date)
+                    today = pd.to_datetime('today').normalize()
+                    days_diff = (today - start_date_dt).days
+                    
+                    # 開始日が7日以内の場合、30日前から取得を試みる
+                    if days_diff <= 7:
+                        logger.debug(f"開始日が近すぎるため、30日前から再取得を試みます ({ticker})")
+                        adjusted_start = (start_date_dt - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
+                        hist_adjusted = stock.history(start=adjusted_start, end=end_date, auto_adjust=True)
+                        
+                        if hist_adjusted is not None and not hist_adjusted.empty:
+                            # 取得したデータから、元の開始日以降のみを抽出
+                            hist_adjusted.index = pd.to_datetime(hist_adjusted.index)
+                            if start_date_dt in hist_adjusted.index or hist_adjusted.index.max() >= start_date_dt:
+                                hist = hist_adjusted[hist_adjusted.index >= start_date_dt]
+                                if not hist.empty:
+                                    logger.info(f"開始日を調整してデータを取得しました ({ticker}): {len(hist)}行")
+                                else:
+                                    # それでも空の場合は、上場廃止の可能性
+                                    logger.warning(f"データが取得できませんでした（空）: {ticker} - 上場廃止の可能性があります")
+                                    return None
+                            else:
+                                # それでも空の場合は、上場廃止の可能性
+                                logger.warning(f"データが取得できませんでした（空）: {ticker} - 上場廃止の可能性があります")
+                                return None
+                        else:
+                            # それでも空の場合は、上場廃止の可能性
+                            logger.warning(f"データが取得できませんでした（空）: {ticker} - 上場廃止の可能性があります")
+                            return None
+                    else:
+                        # 開始日が7日より前の場合、上場廃止の可能性
+                        logger.warning(f"データが取得できませんでした（空）: {ticker} - 上場廃止の可能性があります")
+                        return None
+                except Exception as e:
+                    logger.warning(f"開始日調整中にエラーが発生しました ({ticker}): {str(e)}")
+                    logger.warning(f"データが取得できませんでした（空）: {ticker} - 上場廃止の可能性があります")
+                    return None
             
             # 必要な列が存在するかチェック
             required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -499,9 +535,10 @@ def download_all_stocks(
                 elif not isinstance(last_date, pd.Timestamp):
                     last_date = pd.to_datetime(last_date).date()
                 
-                # 最新日の翌日を計算
+                # 最新日の30日前から取得（yfinanceが短い期間で空を返すのを防ぐため）
                 next_date = pd.to_datetime(last_date) + pd.Timedelta(days=1)
-                start_date_for_ticker = next_date.strftime('%Y-%m-%d')
+                # 30日前から取得するが、既存データの最新日の翌日以降のデータのみを使用
+                start_date_for_ticker = (pd.to_datetime(last_date) - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
                 
                 # 最新データが既にある場合はスキップ
                 today = pd.to_datetime('today').normalize()
@@ -531,6 +568,25 @@ def download_all_stocks(
         
         # 更新モードの場合、既存データとマージ
         if update_mode and existing_df is not None and not existing_df.empty:
+            # 既存データの最新日の翌日以降のデータのみを使用
+            last_date = existing_df['Date'].max()
+            if isinstance(last_date, str):
+                last_date = pd.to_datetime(last_date).date()
+            elif not isinstance(last_date, pd.Timestamp):
+                last_date = pd.to_datetime(last_date).date()
+            
+            next_date = pd.to_datetime(last_date) + pd.Timedelta(days=1)
+            # 最新日の翌日以降のデータのみを抽出
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df[df['Date'] >= next_date].copy()
+            df['Date'] = df['Date'].dt.date
+            
+            if df.empty:
+                # 新しいデータがない場合は既存データを保持
+                logger.debug(f"新しいデータがありません: {ticker}")
+                skip_count += 1
+                continue
+            
             df = merge_data(existing_df, df)
         
         # CSV保存
