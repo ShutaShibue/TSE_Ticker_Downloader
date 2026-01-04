@@ -135,33 +135,75 @@ def get_tokyo_stock_list_from_tse(
                 code_column = df.columns[0]
                 logger.warning(f"コード列が見つかりませんでした。最初の列 '{code_column}' を使用します。")
             
-            # 銘柄コードを抽出（4桁の数値のみ）
-            tickers = []
-            for value in df[code_column].dropna():
-                value_str = str(value).strip()
+            # 銘柄名列を探す（列名は「銘柄名」で固定）
+            name_column = None
+            for col in df.columns:
+                col_str = str(col).strip()
+                if col_str == '銘柄名':
+                    name_column = col
+                    break
+            
+            # 「銘柄名」が見つからない場合、類似の列名を探す（フォールバック）
+            if name_column is None:
+                for col in df.columns:
+                    col_str = str(col).strip()
+                    if '銘柄名' in col_str or '名称' in col_str or '会社名' in col_str or 'name' in col_str.lower():
+                        name_column = col
+                        logger.warning(f"「銘柄名」列が見つかりませんでした。「{col_str}」列を使用します。")
+                        break
+            
+            # 銘柄コードと銘柄名を抽出
+            ticker_data = []
+            for idx, row in df.iterrows():
+                code_value = row[code_column]
+                code_str = str(code_value).strip()
+                
                 # 数値のみを抽出（4桁）
-                if value_str.isdigit() and len(value_str) == 4:
-                    tickers.append(value_str.zfill(4))
-                elif '.' in value_str:
+                ticker_code = None
+                if code_str.isdigit() and len(code_str) == 4:
+                    ticker_code = code_str.zfill(4)
+                elif '.' in code_str:
                     # 小数点を含む場合は整数部分を使用
-                    int_part = value_str.split('.')[0]
+                    int_part = code_str.split('.')[0]
                     if int_part.isdigit() and len(int_part) == 4:
-                        tickers.append(int_part.zfill(4))
+                        ticker_code = int_part.zfill(4)
+                
+                if ticker_code:
+                    # 銘柄名を取得
+                    if name_column is not None:
+                        name_value = row[name_column]
+                        ticker_name = str(name_value).strip() if pd.notna(name_value) else ""
+                    else:
+                        ticker_name = ""
+                    
+                    ticker_data.append({
+                        'ticker': ticker_code,
+                        'name': ticker_name
+                    })
             
-            # 重複を除去してソート
-            tickers = sorted(list(set(tickers)))
-            
-            if not tickers:
+            if not ticker_data:
                 logger.error("銘柄コードが抽出できませんでした。")
                 return None
+            
+            # 重複を除去（tickerをキーに）
+            seen = set()
+            unique_ticker_data = []
+            for item in ticker_data:
+                if item['ticker'] not in seen:
+                    seen.add(item['ticker'])
+                    unique_ticker_data.append(item)
+            
+            # tickerでソート
+            unique_ticker_data = sorted(unique_ticker_data, key=lambda x: x['ticker'])
+            tickers = [item['ticker'] for item in unique_ticker_data]
             
             logger.info(f"東証から {len(tickers)} 銘柄を取得しました")
             
             # CSVファイルに保存
             if save_to_csv:
-                ticker_df = pd.DataFrame({'ticker': tickers})
-                ticker_df.to_csv(csv_path, index=False)
-                logger.info(f"銘柄リストを {csv_path} に保存しました")
+                ticker_df = pd.DataFrame(unique_ticker_data)
+                ticker_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                logger.info(f"銘柄リストを {csv_path} に保存しました（銘柄名も含む）")
             
             return tickers
             
