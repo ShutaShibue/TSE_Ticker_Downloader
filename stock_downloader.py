@@ -42,12 +42,15 @@ def get_tokyo_stock_list_from_csv(csv_path: str = "tickers.csv") -> Optional[Lis
     try:
         df = pd.read_csv(csv_path)
         # 'ticker' または 'code' または最初の列を使用
+        # 文字列として扱う（アルファベットを含む可能性があるため）
         if 'ticker' in df.columns:
-            tickers = df['ticker'].astype(str).str.zfill(4).tolist()
+            tickers = df['ticker'].astype(str).str.strip().tolist()
         elif 'code' in df.columns:
-            tickers = df['code'].astype(str).str.zfill(4).tolist()
+            tickers = df['code'].astype(str).str.strip().tolist()
         else:
-            tickers = df.iloc[:, 0].astype(str).str.zfill(4).tolist()
+            tickers = df.iloc[:, 0].astype(str).str.strip().tolist()
+        # 空文字列を除外
+        tickers = [t for t in tickers if t]
         return tickers
     except Exception as e:
         logger.error(f"CSV読み込みエラー: {str(e)}")
@@ -121,17 +124,9 @@ def get_tokyo_stock_list_from_tse(
                     code_column = col
                     break
             
-            # コード列が見つからない場合、最初の数値列を試す
+            # コード列が見つからない場合、最初の列を試す
             if code_column is None:
-                for col in df.columns:
-                    # 最初の数値列で、4桁の数値が含まれている列を探す
-                    sample_values = df[col].dropna().astype(str)
-                    if any(len(str(v).strip()) == 4 and str(v).strip().isdigit() for v in sample_values.head(10)):
-                        code_column = col
-                        break
-            
-            if code_column is None:
-                # 最初の列を使用
+                # 最初の列を使用（銘柄コードは文字列として扱う）
                 code_column = df.columns[0]
                 logger.warning(f"コード列が見つかりませんでした。最初の列 '{code_column}' を使用します。")
             
@@ -156,30 +151,35 @@ def get_tokyo_stock_list_from_tse(
             ticker_data = []
             for idx, row in df.iterrows():
                 code_value = row[code_column]
+                
+                # 文字列として扱う（アルファベットを含む可能性があるため）
+                if pd.isna(code_value):
+                    continue
+                
                 code_str = str(code_value).strip()
                 
-                # 数値のみを抽出（4桁）
-                ticker_code = None
-                if code_str.isdigit() and len(code_str) == 4:
-                    ticker_code = code_str.zfill(4)
-                elif '.' in code_str:
-                    # 小数点を含む場合は整数部分を使用
-                    int_part = code_str.split('.')[0]
-                    if int_part.isdigit() and len(int_part) == 4:
-                        ticker_code = int_part.zfill(4)
+                # 空文字列や無効な値をスキップ
+                if not code_str or code_str.lower() in ['nan', 'none', '']:
+                    continue
                 
-                if ticker_code:
-                    # 銘柄名を取得
-                    if name_column is not None:
-                        name_value = row[name_column]
-                        ticker_name = str(name_value).strip() if pd.notna(name_value) else ""
-                    else:
-                        ticker_name = ""
-                    
-                    ticker_data.append({
-                        'ticker': ticker_code,
-                        'name': ticker_name
-                    })
+                # 小数点を含む場合は整数部分を使用（数値の場合）
+                if '.' in code_str and code_str.replace('.', '').isdigit():
+                    code_str = code_str.split('.')[0]
+                
+                # 銘柄コードとして有効な値（空でない文字列）を抽出
+                ticker_code = code_str
+                
+                # 銘柄名を取得
+                if name_column is not None:
+                    name_value = row[name_column]
+                    ticker_name = str(name_value).strip() if pd.notna(name_value) else ""
+                else:
+                    ticker_name = ""
+                
+                ticker_data.append({
+                    'ticker': ticker_code,
+                    'name': ticker_name
+                })
             
             if not ticker_data:
                 logger.error("銘柄コードが抽出できませんでした。")
