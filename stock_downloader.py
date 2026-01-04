@@ -40,7 +40,26 @@ def get_tokyo_stock_list_from_csv(csv_path: str = "tickers.csv") -> Optional[Lis
         return None
     
     try:
-        df = pd.read_csv(csv_path)
+        # 証券コード列を文字列として読み込む（dtypeを使用）
+        # これにより、131Aなどの文字列を含む証券コードが正しく読み込まれる
+        df = pd.read_csv(csv_path, dtype=str)
+        
+        # 「市場・商品区分」列を探す
+        market_column = None
+        for col in df.columns:
+            col_str = str(col).strip()
+            if '市場・商品区分' in col_str or '市場' in col_str or '商品区分' in col_str or 'market' in col_str.lower():
+                market_column = col
+                break
+        
+        # PRO Marketの銘柄を除外
+        if market_column is not None and market_column in df.columns:
+            pro_market_mask = df[market_column].astype(str).str.contains('PRO Market', case=False, na=False)
+            pro_market_count = pro_market_mask.sum()
+            if pro_market_count > 0:
+                df = df[~pro_market_mask]
+                logger.info(f"CSVからPRO Marketの銘柄 {pro_market_count} 件を除外しました")
+        
         # 'ticker' または 'code' または最初の列を使用
         # 文字列として扱う（アルファベットを含む可能性があるため）
         if 'ticker' in df.columns:
@@ -51,6 +70,8 @@ def get_tokyo_stock_list_from_csv(csv_path: str = "tickers.csv") -> Optional[Lis
             tickers = df.iloc[:, 0].astype(str).str.strip().tolist()
         # 空文字列を除外
         tickers = [t for t in tickers if t]
+        # 'nan'などの無効な値を除外
+        tickers = [t for t in tickers if t.lower() not in ['nan', 'none', '']]
         return tickers
     except Exception as e:
         logger.error(f"CSV読み込みエラー: {str(e)}")
@@ -113,12 +134,13 @@ def get_tokyo_stock_list_from_tse(
             # Excelファイルを読み込む
             logger.info("Excelファイルを読み込み中...")
             # 複数のシートがある可能性があるため、最初のシートを読み込む
-            df = pd.read_excel(tmp_file_path, sheet_name=0, engine='xlrd')
+            # まず列名を確認するために1行だけ読み込む
+            df_header = pd.read_excel(tmp_file_path, sheet_name=0, engine='xlrd', nrows=0)
             
             # 銘柄コード列を探す
             # 一般的な列名: 'コード', '銘柄コード', 'コード番号', 'Code' など
             code_column = None
-            for col in df.columns:
+            for col in df_header.columns:
                 col_str = str(col).strip()
                 if 'コード' in col_str or 'code' in col_str.lower() or col_str == 'Code':
                     code_column = col
@@ -127,8 +149,13 @@ def get_tokyo_stock_list_from_tse(
             # コード列が見つからない場合、最初の列を試す
             if code_column is None:
                 # 最初の列を使用（銘柄コードは文字列として扱う）
-                code_column = df.columns[0]
+                code_column = df_header.columns[0]
                 logger.warning(f"コード列が見つかりませんでした。最初の列 '{code_column}' を使用します。")
+            
+            # 証券コード列を文字列として読み込む（convertersを使用）
+            # これにより、131Aなどの文字列を含む証券コードが正しく読み込まれる
+            converters = {code_column: str}
+            df = pd.read_excel(tmp_file_path, sheet_name=0, engine='xlrd', converters=converters)
             
             # 銘柄名列を探す（列名は「銘柄名」で固定）
             name_column = None
@@ -147,8 +174,17 @@ def get_tokyo_stock_list_from_tse(
                         logger.warning(f"「銘柄名」列が見つかりませんでした。「{col_str}」列を使用します。")
                         break
             
+            # 「市場・商品区分」列を探す
+            market_column = None
+            for col in df.columns:
+                col_str = str(col).strip()
+                if '市場・商品区分' in col_str or '市場' in col_str or '商品区分' in col_str or 'market' in col_str.lower():
+                    market_column = col
+                    break
+            
             # 銘柄コードと銘柄名を抽出
             ticker_data = []
+            pro_market_count = 0
             for idx, row in df.iterrows():
                 code_value = row[code_column]
                 
@@ -162,9 +198,25 @@ def get_tokyo_stock_list_from_tse(
                 if not code_str or code_str.lower() in ['nan', 'none', '']:
                     continue
                 
-                # 小数点を含む場合は整数部分を使用（数値の場合）
-                if '.' in code_str and code_str.replace('.', '').isdigit():
-                    code_str = code_str.split('.')[0]
+                # 市場・商品区分をチェック（PRO Marketの場合はスキップ）
+                if market_column is not None:
+                    market_value = row[market_column]
+                    if pd.notna(market_value):
+                        market_str = str(market_value).strip()
+                        if 'PRO Market' in market_str or '[PRO Market]' in market_str:
+                            pro_market_count += 1
+                            continue
+                
+                # 数値として読み込まれた場合の処理（例: 131Aが131.0として読み込まれた場合）
+                # ただし、文字列を含む証券コードはそのまま保持する
+                # 小数点を含み、かつ小数点を除いた部分が数値のみの場合のみ処理
+                if '.' in code_str:
+                    # 小数点を除いた部分をチェック
+                    parts = code_str.split('.')
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].replace('0', '').replace('.', '') == '':
+                        # 純粋な数値（例: 131.0）の場合のみ整数部分を使用
+                        code_str = parts[0]
+                    # それ以外（例: 131A.0など）はそのまま保持
                 
                 # 銘柄コードとして有効な値（空でない文字列）を抽出
                 ticker_code = code_str
@@ -180,6 +232,9 @@ def get_tokyo_stock_list_from_tse(
                     'ticker': ticker_code,
                     'name': ticker_name
                 })
+            
+            if pro_market_count > 0:
+                logger.info(f"PRO Marketの銘柄 {pro_market_count} 件を除外しました")
             
             if not ticker_data:
                 logger.error("銘柄コードが抽出できませんでした。")
@@ -262,7 +317,7 @@ def get_tokyo_stock_list(use_jpx: bool = True) -> List[str]:
     return [f"{i:04d}" for i in range(1000, 10000)]
 
 
-def get_stock_data(ticker: str, start_date: str, end_date: Optional[str] = None) -> Optional[pd.DataFrame]:
+def get_stock_data(ticker: str, start_date: str, end_date: Optional[str] = None, max_retries: int = 3) -> Optional[pd.DataFrame]:
     """
     指定された銘柄の日足データを取得
     
@@ -270,6 +325,7 @@ def get_stock_data(ticker: str, start_date: str, end_date: Optional[str] = None)
         ticker: 銘柄コード（例: '7203'）
         start_date: 開始日（YYYY-MM-DD形式）
         end_date: 終了日（YYYY-MM-DD形式、Noneの場合は最新まで）
+        max_retries: 最大リトライ回数（デフォルト: 3）
     
     Returns:
         DataFrame（日付, Open, High, Low, Close, Volume, Adjusted Close）
@@ -278,25 +334,66 @@ def get_stock_data(ticker: str, start_date: str, end_date: Optional[str] = None)
     # 日本株の場合は '.T' を付ける
     yahoo_ticker = f"{ticker}.T"
     
-    try:
-        stock = yf.Ticker(yahoo_ticker)
-        hist = stock.history(start=start_date, end=end_date, auto_adjust=True)
+    for attempt in range(max_retries):
+        try:
+            stock = yf.Ticker(yahoo_ticker)
+            hist = stock.history(start=start_date, end=end_date, auto_adjust=True)
+            
+            # histがNoneの場合のチェック
+            if hist is None:
+                if attempt < max_retries - 1:
+                    logger.warning(f"データがNoneでした ({ticker}), リトライ中... ({attempt + 1}/{max_retries})")
+                    time.sleep(2 * (attempt + 1))  # 指数バックオフ
+                    continue
+                else:
+                    logger.warning(f"データが取得できませんでした（None）: {ticker}")
+                    return None
+            
+            # 空のDataFrameの場合のチェック
+            if hist.empty:
+                # エラーメッセージから上場廃止の可能性をチェック
+                # yfinanceはエラーメッセージをログに出力するが、例外を投げない場合がある
+                logger.warning(f"データが取得できませんでした（空）: {ticker} - 上場廃止の可能性があります")
+                return None
+            
+            # 必要な列が存在するかチェック
+            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            missing_columns = [col for col in required_columns if col not in hist.columns]
+            if missing_columns:
+                logger.warning(f"必要な列が存在しません ({ticker}): {missing_columns}")
+                return None
+            
+            # 調整済み価格を使用（auto_adjust=Trueで自動的に調整済み価格が使用される）
+            # 列名を整理
+            df = hist[required_columns].copy()
+            df.reset_index(inplace=True)
+            df['Date'] = pd.to_datetime(df['Date']).dt.date
+            
+            return df
         
-        if hist.empty:
-            logger.warning(f"データが取得できませんでした: {ticker}")
-            return None
-        
-        # 調整済み価格を使用（auto_adjust=Trueで自動的に調整済み価格が使用される）
-        # 列名を整理
-        df = hist[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        df.reset_index(inplace=True)
-        df['Date'] = pd.to_datetime(df['Date']).dt.date
-        
-        return df
+        except Exception as e:
+            error_msg = str(e)
+            # 上場廃止の可能性がある場合のチェック
+            if 'possibly delisted' in error_msg.lower() or 'no price data found' in error_msg.lower():
+                logger.warning(f"上場廃止の可能性があります ({ticker}): {error_msg}")
+                return None
+            
+            # ネットワークエラーの場合はリトライ
+            if ('curl' in error_msg.lower() or 'resolve host' in error_msg.lower() or 
+                'connection' in error_msg.lower() or 'timeout' in error_msg.lower()):
+                if attempt < max_retries - 1:
+                    logger.warning(f"ネットワークエラー ({ticker}), リトライ中... ({attempt + 1}/{max_retries}): {error_msg}")
+                    time.sleep(5 * (attempt + 1))  # ネットワークエラー時は長めに待機
+                    continue
+                else:
+                    logger.error(f"ネットワークエラーが発生しました ({ticker}): {error_msg}")
+                    return None
+            else:
+                # その他のエラーはリトライしない
+                logger.error(f"エラーが発生しました ({ticker}): {error_msg}")
+                return None
     
-    except Exception as e:
-        logger.error(f"エラーが発生しました ({ticker}): {str(e)}")
-        return None
+    return None
 
 
 def save_to_csv(df: pd.DataFrame, ticker: str, output_dir: str = "data") -> bool:
@@ -386,6 +483,7 @@ def download_all_stocks(
     success_count = 0
     skip_count = 0
     error_count = 0
+    delisted_count = 0  # 上場廃止の可能性がある銘柄数
     
     for ticker in tqdm(tickers, desc="データ取得中"):
         existing_df = None
@@ -420,7 +518,14 @@ def download_all_stocks(
         df = get_stock_data(ticker, start_date_for_ticker, end_date)
         
         if df is None or df.empty:
-            error_count += 1
+            # 更新モードで既存データがある場合、上場廃止の可能性があるが既存データは保持
+            if update_mode and existing_df is not None and not existing_df.empty:
+                # 既存データをそのまま保持（上場廃止の可能性がある）
+                delisted_count += 1
+                logger.info(f"既存データを保持します（上場廃止の可能性）: {ticker}")
+            else:
+                # 初回取得でデータが取得できない場合はエラー
+                error_count += 1
             time.sleep(delay)
             continue
         
@@ -437,5 +542,5 @@ def download_all_stocks(
         # API呼び出し間隔を空ける
         time.sleep(delay)
     
-    logger.info(f"完了: 成功={success_count}, スキップ={skip_count}, エラー={error_count}")
+    logger.info(f"完了: 成功={success_count}, スキップ={skip_count}, エラー={error_count}, 上場廃止の可能性={delisted_count}")
 
