@@ -10,6 +10,9 @@ from tqdm import tqdm
 import logging
 import requests
 from pathlib import Path
+import tempfile
+import re
+from urllib.parse import urljoin
 
 # ログ設定
 logging.basicConfig(
@@ -51,37 +54,142 @@ def get_tokyo_stock_list_from_csv(csv_path: str = "tickers.csv") -> Optional[Lis
         return None
 
 
-def get_tokyo_stock_list_from_tse() -> Optional[List[str]]:
+def get_tokyo_stock_list_from_tse(
+    excel_url: Optional[str] = None,
+    save_to_csv: bool = True,
+    csv_path: str = "tickers.csv"
+) -> Optional[List[str]]:
     """
     東証のウェブサイトから銘柄リストを取得
-    注意: 東証のサイト構造が変更された場合、動作しない可能性があります
+    https://www.jpx.co.jp/markets/statistics-equities/misc/01.html のExcelファイルから取得
+    
+    Args:
+        excel_url: ExcelファイルのURL（Noneの場合は自動検出を試みる）
+        save_to_csv: tickers.csvに保存するかどうか
+        csv_path: 保存先のCSVファイルパス
     
     Returns:
         銘柄コードのリスト、取得失敗時はNone
     """
     try:
-        # 東証の銘柄リストを取得（実際のURLは変更される可能性がある）
-        # ここでは簡易版として、主要な銘柄コードの範囲を返す
-        # 実際の運用では、東証の公式APIやCSVダウンロード機能を使用することを推奨
+        # ExcelファイルのURL
+        if excel_url is None:
+            # 東証の銘柄一覧ページからExcelファイルのURLを取得
+            base_url = "https://www.jpx.co.jp"
+            list_page_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
+            
+            logger.info("東証の銘柄一覧ページからExcelファイルのURLを取得中...")
+            response = requests.get(list_page_url, timeout=30)
+            response.raise_for_status()
+            
+            # HTMLからExcelファイルのURLを抽出
+            # パターン: data_j.xls または data_j.xlsx
+            excel_pattern = r'href=["\']([^"\']*data[^"\']*\.xls[x]?[^"\']*)["\']'
+            matches = re.findall(excel_pattern, response.text, re.IGNORECASE)
+            
+            if not matches:
+                # 直接的なURLパターンを試す
+                # 通常は /markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls のような形式
+                excel_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+                logger.info(f"デフォルトURLを使用: {excel_url}")
+            else:
+                excel_url = urljoin(base_url, matches[0])
+                logger.info(f"ExcelファイルのURLを検出: {excel_url}")
         
-        # 東証の銘柄コードは通常4桁（1000-9999）
-        # 実際には全てのコードが有効な銘柄ではないため、
-        # 有効な銘柄のみをフィルタリングする必要がある
+        # Excelファイルをダウンロード
+        logger.info("Excelファイルをダウンロード中...")
+        response = requests.get(excel_url, timeout=30)
+        response.raise_for_status()
         
-        logger.warning("東証のウェブサイトからの自動取得は未実装です。")
-        logger.warning("tickers.csvファイルを用意するか、全銘柄コードを試行します。")
+        # 一時ファイルに保存
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xls') as tmp_file:
+            tmp_file.write(response.content)
+            tmp_file_path = tmp_file.name
+        
+        try:
+            # Excelファイルを読み込む
+            logger.info("Excelファイルを読み込み中...")
+            # 複数のシートがある可能性があるため、最初のシートを読み込む
+            df = pd.read_excel(tmp_file_path, sheet_name=0, engine='xlrd')
+            
+            # 銘柄コード列を探す
+            # 一般的な列名: 'コード', '銘柄コード', 'コード番号', 'Code' など
+            code_column = None
+            for col in df.columns:
+                col_str = str(col).strip()
+                if 'コード' in col_str or 'code' in col_str.lower() or col_str == 'Code':
+                    code_column = col
+                    break
+            
+            # コード列が見つからない場合、最初の数値列を試す
+            if code_column is None:
+                for col in df.columns:
+                    # 最初の数値列で、4桁の数値が含まれている列を探す
+                    sample_values = df[col].dropna().astype(str)
+                    if any(len(str(v).strip()) == 4 and str(v).strip().isdigit() for v in sample_values.head(10)):
+                        code_column = col
+                        break
+            
+            if code_column is None:
+                # 最初の列を使用
+                code_column = df.columns[0]
+                logger.warning(f"コード列が見つかりませんでした。最初の列 '{code_column}' を使用します。")
+            
+            # 銘柄コードを抽出（4桁の数値のみ）
+            tickers = []
+            for value in df[code_column].dropna():
+                value_str = str(value).strip()
+                # 数値のみを抽出（4桁）
+                if value_str.isdigit() and len(value_str) == 4:
+                    tickers.append(value_str.zfill(4))
+                elif '.' in value_str:
+                    # 小数点を含む場合は整数部分を使用
+                    int_part = value_str.split('.')[0]
+                    if int_part.isdigit() and len(int_part) == 4:
+                        tickers.append(int_part.zfill(4))
+            
+            # 重複を除去してソート
+            tickers = sorted(list(set(tickers)))
+            
+            if not tickers:
+                logger.error("銘柄コードが抽出できませんでした。")
+                return None
+            
+            logger.info(f"東証から {len(tickers)} 銘柄を取得しました")
+            
+            # CSVファイルに保存
+            if save_to_csv:
+                ticker_df = pd.DataFrame({'ticker': tickers})
+                ticker_df.to_csv(csv_path, index=False)
+                logger.info(f"銘柄リストを {csv_path} に保存しました")
+            
+            return tickers
+            
+        finally:
+            # 一時ファイルを削除
+            try:
+                os.unlink(tmp_file_path)
+            except:
+                pass
+                
+    except requests.RequestException as e:
+        logger.error(f"Excelファイルのダウンロードエラー: {str(e)}")
         return None
     except Exception as e:
         logger.error(f"東証からの銘柄リスト取得エラー: {str(e)}")
         return None
 
 
-def get_tokyo_stock_list() -> List[str]:
+def get_tokyo_stock_list(use_jpx: bool = True) -> List[str]:
     """
     東証上場銘柄のリストを取得
     優先順位:
     1. tickers.csvファイルから読み込み
-    2. 全銘柄コード（1000-9999）を返す（実際には有効でない銘柄も含む）
+    2. 東証のウェブサイトから自動取得（use_jpx=Trueの場合）
+    3. 全銘柄コード（1000-9999）を返す（実際には有効でない銘柄も含む）
+    
+    Args:
+        use_jpx: 東証のウェブサイトから自動取得を試みるかどうか
     
     Returns:
         銘柄コードのリスト
@@ -92,11 +200,22 @@ def get_tokyo_stock_list() -> List[str]:
         logger.info(f"CSVファイルから {len(tickers)} 銘柄を読み込みました")
         return tickers
     
-    # CSVファイルがない場合、全銘柄コードを返す
+    # CSVファイルがない場合、東証のウェブサイトから取得を試みる
+    if use_jpx:
+        logger.info("tickers.csvが見つかりません。東証のウェブサイトから取得を試みます...")
+        tickers = get_tokyo_stock_list_from_tse()
+        if tickers:
+            logger.info(f"東証から {len(tickers)} 銘柄を取得しました")
+            return tickers
+        else:
+            logger.warning("東証からの取得に失敗しました。")
+    
+    # それでも取得できない場合、全銘柄コードを返す
     # 注意: 実際には全てのコードが有効な銘柄ではないため、
     # データ取得時にエラーになる銘柄はスキップされる
     logger.warning("tickers.csvが見つかりません。全銘柄コード（1000-9999）を試行します。")
-    logger.warning("有効な銘柄のみを取得するには、tickers.csvファイルを用意してください。")
+    logger.warning("有効な銘柄のみを取得するには、tickers.csvファイルを用意するか、")
+    logger.warning("東証のウェブサイトから自動取得を有効にしてください。")
     
     return [f"{i:04d}" for i in range(1000, 10000)]
 
