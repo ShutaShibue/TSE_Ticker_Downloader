@@ -23,27 +23,10 @@ pip install -r requirements.txt
 プログラムは自動的に[東証の上場銘柄一覧](https://www.jpx.co.jp/markets/statistics-equities/misc/01.html)から最新の銘柄リストを取得し、`tickers.csv`に保存します。
 銘柄コードと銘柄名の両方が保存されます。
 
-**手動準備**:
-`tickers.csv`ファイルを手動で用意することもできます。以下の形式で作成してください：
-
-```csv
-ticker,name
-7203,トヨタ自動車
-6758,ソニーグループ
-9984,ソフトバンクグループ
-...
-```
-
-`name`列は省略可能です。`ticker`列のみでも動作します。
-
-`tickers.csv`がない場合、プログラムは自動的に東証のウェブサイトから取得を試みます。
-それでも取得できない場合、1000-9999の全銘柄コードを試行しますが、
-有効でない銘柄も含まれるため、エラーが多くなります。
-
 ### 初回データ取得
 
 ```bash
-python download_stocks.py --start-date 2016-01-01
+python download_stocks.py
 ```
 
 オプション：
